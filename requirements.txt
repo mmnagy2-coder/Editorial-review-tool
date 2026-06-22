@@ -1,0 +1,10 @@
+streamlit>=1.32.0
+yt-dlp>=2024.3.10
+openai-whisper>=20231117
+scenedetect[opencv]>=0.6.3
+opencv-python-headless>=4.9.0.80
+plotly>=5.20.0
+openai>=1.14.0
+numpy>=1.26.0
+fuzzywuzzy>=0.18.0
+python-Levenshtein>=0.25.0
