@@ -1,6 +1,8 @@
-ffmpeg
-libglib2.0-0
 libsm6
 libxrender1
 libxext6
 libgl1
+# Removed `ffmpeg` and `libglib2.0-0` because they caused unmet
+# dependency issues in the deployment environment. Use the
+# Python wheel `imageio-ffmpeg` (added to requirements.txt) instead
+# which provides a portable ffmpeg binary.
