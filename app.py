@@ -21,7 +21,12 @@ from typing import Optional
 import numpy as np
 import streamlit as st
 import plotly.graph_objects as go
-import cv2
+try:
+    import cv2
+    CV2_IMPORT_ERROR = None
+except Exception as _cv2_exc:
+    cv2 = None
+    CV2_IMPORT_ERROR = _cv2_exc
 import whisper
 import yt_dlp
 from scenedetect import detect, ContentDetector
@@ -637,6 +642,14 @@ def main():
     st.title("🎬 AI Editorial Review")
     st.markdown('<span class="accent">Proof of Concept</span> — pacing, scene structure '
                 'and narrative-consistency analysis for short films.', unsafe_allow_html=True)
+
+    if cv2 is None:
+        st.error(
+            "OpenCV (cv2) failed to import. This usually means a missing system GUI library (libGL). "
+            "Ensure the host provides system packages listed in `packages.txt` (ffmpeg, libgl1-mesa-glx, etc.) "
+            "or install opencv-python-headless instead of opencv-python. Full error: %s" % (CV2_IMPORT_ERROR)
+        )
+        return
 
     with st.sidebar:
         st.header("Settings")
