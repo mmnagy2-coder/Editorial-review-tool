@@ -240,6 +240,12 @@ def download_video(url: str) -> str:
 
     ffmpeg_path = os.environ.get("FFMPEG_BINARY") or shutil.which("ffmpeg")
     if not ffmpeg_path:
+        try:
+            import imageio_ffmpeg
+            ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            ffmpeg_path = None
+    if not ffmpeg_path:
         raise RuntimeError("Could not download video: ffmpeg binary not found. Install ffmpeg or set FFMPEG_BINARY.")
 
     # Base options with anti-bot headers
