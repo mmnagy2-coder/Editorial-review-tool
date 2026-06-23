@@ -538,16 +538,14 @@ def check_narrative_consistency(transcript_key: str, early_text: str, late_text:
         "contradictions or changes in their goals or information. Explain simply, in "
         "3-5 sentences."
     )
-    # Use Anthropic / Claude completion endpoint. Wrap prompt in HUMAN/ASSISTANT markers.
-    full_prompt = f"\n\nHuman: {prompt}\n\nAssistant:"
     try:
-        resp = client.completions.create(
-            model="claude-2.1",
-            prompt=full_prompt,
-            max_tokens_to_sample=300,
+        resp = client.messages.create(
+            model="claude-3-5-haiku-20241022",
+            max_tokens=300,
             temperature=0.3,
+            messages=[{"role": "user", "content": prompt}],
         )
-        return (resp.get("completion") or "").strip()
+        return resp.content[0].text.strip()
     except Exception as exc:
         return f"⚠️ Narrative consistency check failed: {exc}"
 
