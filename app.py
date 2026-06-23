@@ -13,8 +13,10 @@ import os
 import re
 import json
 import hashlib
+import shutil
 import tempfile
 from datetime import datetime
+from typing import Optional
 
 import numpy as np
 import streamlit as st
@@ -160,7 +162,12 @@ def url_hash(url: str) -> str:
 
 
 def get_openai_client():
-    api_key = st.secrets.get("OPENAI_API_KEY") if hasattr(st, "secrets") else None
+    api_key = None
+    if hasattr(st, "secrets"):
+        try:
+            api_key = st.secrets.get("OPENAI_API_KEY")
+        except Exception:
+            api_key = None
     api_key = api_key or os.environ.get("OPENAI_API_KEY")
     if not api_key or OpenAI is None:
         return None
@@ -181,20 +188,65 @@ def download_video(url: str) -> str:
     if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
         return out_path
 
+    ffmpeg_path = os.environ.get("FFMPEG_BINARY") or shutil.which("ffmpeg")
+    if not ffmpeg_path:
+        raise RuntimeError("Could not download video: ffmpeg binary not found. Install ffmpeg or set FFMPEG_BINARY.")
+
     ydl_opts = {
         "format": "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360]",
         "outtmpl": out_path,
         "merge_output_format": "mp4",
         "download_ranges": yt_dlp.utils.download_range_func(None, [(0, MAX_DURATION_SECONDS)]),
         "force_keyframes_at_cuts": True,
+        "ffmpeg_location": ffmpeg_path,
         "quiet": True,
         "no_warnings": True,
     }
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+
+    def _download(opts):
+        with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([url])
+
+    try:
+        _download(ydl_opts)
     except Exception as exc:
-        raise RuntimeError(f"Could not download video: {exc}") from exc
+        original_error = str(exc)
+        fallback_attempts = [
+            {
+                "format": "best[height<=360]",
+                "outtmpl": out_path,
+                "merge_output_format": "mp4",
+                "ffmpeg_location": ffmpeg_path,
+                "quiet": True,
+                "no_warnings": True,
+            },
+            {
+                "format": "best[height<=360][ext=mp4]/best[height<=360]",
+                "outtmpl": out_path,
+                "merge_output_format": "mp4",
+                "ffmpeg_location": ffmpeg_path,
+                "allow_unplayable_formats": True,
+                "geo_bypass": True,
+                "quiet": True,
+                "no_warnings": True,
+            },
+        ]
+
+        last_error = exc
+        for fallback_opts in fallback_attempts:
+            try:
+                _download(fallback_opts)
+                last_error = None
+                break
+            except Exception as exc2:
+                last_error = exc2
+
+        if last_error is not None:
+            raise RuntimeError(
+                "Could not download video: original error: %s; fallback error: %s" % (
+                    original_error, last_error
+                )
+            ) from last_error
 
     if not os.path.exists(out_path):
         raise RuntimeError("Download finished but no output file was produced.")
@@ -527,7 +579,7 @@ def generate_text_report(url, scenes, pacing_issues, narrative_result, script_di
 # --------------------------------------------------------------------------
 # Main analysis pipeline (drives the spinner / progress steps)
 # --------------------------------------------------------------------------
-def run_analysis(url: str, script_text: str | None, progress_bar, status_text):
+def run_analysis(url: str, script_text: Optional[str], progress_bar, status_text):
     steps = [
         "Downloading video...",
         "Transcribing audio...",
