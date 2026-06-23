@@ -23,12 +23,20 @@ brew install ffmpeg
 streamlit run app.py
 ```
 
+## Running tests
+
+If you want to verify the helper functions and URL parsing, run:
+
+```bash
+python3 -m unittest test_app.py
+```
+
 ## Streamlit deployment
 
-1. Create `.streamlit/secrets.toml` with your OpenAI key:
+1. Create `.streamlit/secrets.toml` with your Anthropic (Claude) key:
 
 ```toml
-OPENAI_API_KEY = "your-openai-api-key"
+ANTHROPIC_API_KEY = "your-anthropic-api-key"
 ```
 
 2. Add the system dependencies needed for OpenCV and ffmpeg.

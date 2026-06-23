@@ -33,9 +33,9 @@ from scenedetect import detect, ContentDetector
 from fuzzywuzzy import fuzz
 
 try:
-    from openai import OpenAI
+    from anthropic import Client as AnthropicClient
 except ImportError:
-    OpenAI = None
+    AnthropicClient = None
 
 # --------------------------------------------------------------------------
 # Constants & configuration
@@ -48,7 +48,10 @@ RUSH_WINDOW_SECONDS = 5
 PACING_DIP_MIN_DURATION = 15        # seconds of near-identical shot length = "dip"
 PACING_DIP_VARIANCE_THRESHOLD = 0.6 # std-dev (s) below this counts as "low variance"
 SILENCE_GAP_FOR_SCENE = 2.0         # seconds of transcript silence => possible scene cut
-DEMO_URL = "https://www.youtube.com/watch?v=7d4ZgJFbF0A"  # Chaplin's "The Kid"
+DEMO_URL = "https://vimeo.com/135459618?share=copy&fl=cl&fe=ci"
+DOWNLOAD_RETRY_ATTEMPTS = 3
+DOWNLOAD_RETRY_DELAY = 2            # seconds between retries
+MAX_VIDEO_SIZE_MB = 500             # max local video file size in MB
 
 # Pre-written micro-lessons shown when "Teaching Mode" is enabled.
 # These are static editorial-craft explanations, not AI generated.
@@ -157,26 +160,67 @@ def fmt_time(seconds: float) -> str:
     return f"{seconds // 60:02d}:{seconds % 60:02d}"
 
 
+from urllib.parse import urlparse
+
+
+def extract_video_id_and_platform(url: str) -> tuple:
+    """Extract video ID and platform from URL. Returns (video_id, platform) or ("", "")."""
+    parsed = urlparse(url)
+    hostname = parsed.hostname or ""
+    path = parsed.path or ""
+
+    # YouTube patterns
+    yt_match = re.search(r"(?:v=|youtu\.be/|embed/)([A-Za-z0-9_-]{11})", url)
+    if yt_match:
+        return (yt_match.group(1), "youtube")
+
+    # Vimeo patterns
+    vm_match = re.search(r"(?:vimeo\.com/|player\.vimeo\.com/video/)([0-9]+)", url)
+    if vm_match:
+        return (vm_match.group(1), "vimeo")
+
+    # Frame.io patterns
+    if hostname.endswith("frame.io"):
+        segments = [seg for seg in path.split("/") if seg]
+        if hostname == "player.frame.io" and segments:
+            return (segments[0], "frameio")
+        if len(segments) >= 1:
+            if segments[0] == "s" and len(segments) >= 2:
+                return (segments[1], "frameio")
+            if segments[-2:] == ["videos"] and len(segments) >= 2:
+                return (segments[-1], "frameio")
+            return (segments[-1], "frameio")
+
+    return ("", "")
+
+
 def extract_video_id(url: str) -> str:
-    match = re.search(r"(?:v=|youtu\.be/|embed/)([A-Za-z0-9_-]{11})", url)
-    return match.group(1) if match else ""
+    """Extract video ID from URL (for backward compatibility)."""
+    video_id, _ = extract_video_id_and_platform(url)
+    return video_id
 
 
 def url_hash(url: str) -> str:
     return hashlib.md5(url.encode("utf-8")).hexdigest()[:12]
 
 
-def get_openai_client():
+def read_script_text(script_file):
+    if script_file is None:
+        return None
+    return script_file.read().decode("utf-8", errors="ignore")
+
+
+def get_claude_client():
     api_key = None
     if hasattr(st, "secrets"):
         try:
-            api_key = st.secrets.get("OPENAI_API_KEY")
+            api_key = st.secrets.get("ANTHROPIC_API_KEY")
         except Exception:
             api_key = None
-    api_key = api_key or os.environ.get("OPENAI_API_KEY")
-    if not api_key or OpenAI is None:
+    api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key or AnthropicClient is None:
         return None
-    return OpenAI(api_key=api_key)
+    return AnthropicClient(api_key=api_key)
 
 
 # --------------------------------------------------------------------------
@@ -186,6 +230,7 @@ def get_openai_client():
 def download_video(url: str) -> str:
     """Download a 360p clip (first MAX_DURATION_SECONDS) of the given YouTube URL.
     Returns the local file path. Cached by URL so re-runs are instant."""
+    import time
     out_dir = os.path.join(tempfile.gettempdir(), "editorial_review_poc")
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, f"{url_hash(url)}.mp4")
@@ -197,61 +242,94 @@ def download_video(url: str) -> str:
     if not ffmpeg_path:
         raise RuntimeError("Could not download video: ffmpeg binary not found. Install ffmpeg or set FFMPEG_BINARY.")
 
+    # Base options with anti-bot headers
+    base_opts = {
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        },
+        "socket_timeout": 30,
+        "ffmpeg_location": ffmpeg_path,
+        "quiet": True,
+        "no_warnings": True,
+    }
+
     ydl_opts = {
+        **base_opts,
         "format": "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360]",
         "outtmpl": out_path,
         "merge_output_format": "mp4",
         "download_ranges": yt_dlp.utils.download_range_func(None, [(0, MAX_DURATION_SECONDS)]),
         "force_keyframes_at_cuts": True,
-        "ffmpeg_location": ffmpeg_path,
-        "quiet": True,
-        "no_warnings": True,
     }
 
     def _download(opts):
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([url])
 
-    try:
-        _download(ydl_opts)
-    except Exception as exc:
-        original_error = str(exc)
-        fallback_attempts = [
-            {
-                "format": "best[height<=360]",
-                "outtmpl": out_path,
-                "merge_output_format": "mp4",
-                "ffmpeg_location": ffmpeg_path,
-                "quiet": True,
-                "no_warnings": True,
-            },
-            {
-                "format": "best[height<=360][ext=mp4]/best[height<=360]",
-                "outtmpl": out_path,
-                "merge_output_format": "mp4",
-                "ffmpeg_location": ffmpeg_path,
-                "allow_unplayable_formats": True,
-                "geo_bypass": True,
-                "quiet": True,
-                "no_warnings": True,
-            },
-        ]
+    fallback_attempts = [
+        {
+            **base_opts,
+            "format": "best[height<=360]",
+            "outtmpl": out_path,
+            "merge_output_format": "mp4",
+            "geo_bypass": True,
+        },
+        {
+            **base_opts,
+            "format": "best[height<=360][ext=mp4]/best[height<=360]",
+            "outtmpl": out_path,
+            "merge_output_format": "mp4",
+            "allow_unplayable_formats": True,
+            "geo_bypass": True,
+        },
+        {
+            **base_opts,
+            "format": "best[height<=360]",
+            "outtmpl": out_path,
+            "merge_output_format": "mp4",
+            "geo_bypass": True,
+            "extractor_args": {"youtube": {"skip": ["hls", "dash"]}},
+        },
+    ]
 
-        last_error = exc
-        for fallback_opts in fallback_attempts:
+    # Try primary format with retries
+    last_error = None
+    for attempt in range(DOWNLOAD_RETRY_ATTEMPTS):
+        try:
+            _download(ydl_opts)
+            if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                return out_path
+        except Exception as exc:
+            last_error = exc
+            if attempt < DOWNLOAD_RETRY_ATTEMPTS - 1:
+                time.sleep(DOWNLOAD_RETRY_DELAY)
+            else:
+                original_error = str(exc)
+                break
+
+    # Try fallback formats
+    for fallback_opts in fallback_attempts:
+        for attempt in range(DOWNLOAD_RETRY_ATTEMPTS):
             try:
                 _download(fallback_opts)
-                last_error = None
-                break
+                if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                    return out_path
             except Exception as exc2:
                 last_error = exc2
+                if attempt < DOWNLOAD_RETRY_ATTEMPTS - 1:
+                    time.sleep(DOWNLOAD_RETRY_DELAY)
 
-        if last_error is not None:
-            raise RuntimeError(
-                "Could not download video: original error: %s; fallback error: %s" % (
-                    original_error, last_error
-                )
-            ) from last_error
+    if last_error is not None:
+        raise RuntimeError(
+            "Could not download video: %s\n\n" 
+            "**Suggestions:**\n"
+            "1. Try a different YouTube URL\n"
+            "2. Try uploading a local video file instead\n"
+            "3. Check that the video is publicly available (not private/restricted)\n"
+            "4. Wait a few minutes and try again (YouTube may be rate-limiting)" % (
+                str(last_error)[:200]
+            )
+        ) from last_error
 
     if not os.path.exists(out_path):
         raise RuntimeError("Download finished but no output file was produced.")
@@ -437,10 +515,10 @@ def compare_to_script(scenes: list, script_text: str) -> dict:
 def check_narrative_consistency(transcript_key: str, early_text: str, late_text: str) -> str:
     """Single GPT-4o-mini call comparing early vs. late dialogue for continuity.
     `transcript_key` exists purely so the cache is keyed per-video."""
-    client = get_openai_client()
+    client = get_claude_client()
     if client is None:
         return (
-            "⚠️ No OpenAI API key found (set OPENAI_API_KEY in st.secrets or the "
+            "⚠️ No Anthropic API key found (set ANTHROPIC_API_KEY in st.secrets or the "
             "environment), so the narrative consistency check was skipped."
         )
 
@@ -454,13 +532,16 @@ def check_narrative_consistency(transcript_key: str, early_text: str, late_text:
         "contradictions or changes in their goals or information. Explain simply, in "
         "3-5 sentences."
     )
+    # Use Anthropic / Claude completion endpoint. Wrap prompt in HUMAN/ASSISTANT markers.
+    full_prompt = f"\n\nHuman: {prompt}\n\nAssistant:"
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
+        resp = client.completions.create(
+            model="claude-2.1",
+            prompt=full_prompt,
+            max_tokens_to_sample=300,
             temperature=0.3,
         )
-        return response.choices[0].message.content.strip()
+        return (resp.get("completion") or "").strip()
     except Exception as exc:
         return f"⚠️ Narrative consistency check failed: {exc}"
 
@@ -510,23 +591,43 @@ def build_timeline_figure(shots, motion, pacing_issues, scene_boundaries, total_
     return fig
 
 
-def youtube_embed(video_id: str, start_seconds: int = 0, height: int = 380):
-    """Embed the YouTube player via the IFrame API. `start_seconds` lets issue
-    cards 'jump' the player to a timecode — clicking a card sets session_state
-    and Streamlit's rerun recreates this embed with the new start time."""
-    html = f"""
-    <div id="player"></div>
-    <script src="https://www.youtube.com/iframe_api"></script>
-    <script>
-      var player;
-      function onYouTubeIframeAPIReady() {{
-        player = new YT.Player('player', {{
-          height: '{height}', width: '100%', videoId: '{video_id}',
-          playerVars: {{ start: {int(start_seconds)}, autoplay: 0, rel: 0 }}
-        }});
-      }}
-    </script>
-    """
+def youtube_embed(video_id: str, start_seconds: int = 0, height: int = 380, platform: str = "youtube"):
+    """Embed video player via IFrame API. Supports YouTube, Vimeo, and Frame.io.
+    `start_seconds` lets issue cards 'jump' the player to a timecode."""
+
+    if platform == "vimeo":
+        html = f"""
+        <div style="padding: 62.5% 0 0 0; position: relative;">
+          <iframe src="https://player.vimeo.com/video/{video_id}?h=&autoplay=0#t={int(start_seconds)}s"
+            style="position: absolute; top: 0; left: 0; width: 100%; height: 100%;"
+            frameborder="0" allow="autoplay; fullscreen; picture-in-picture" allowfullscreen>
+          </iframe>
+        </div>
+        <script src="https://player.vimeo.com/api/player.js"></script>
+        """
+    elif platform == "frameio":
+        html = f"""
+        <div style="padding: 62.5% 0 0 0; position: relative;">
+          <iframe src="https://player.frame.io/{video_id}"
+            style="position: absolute; top: 0; left: 0; width: 100%; height: 100%;"
+            frameborder="0" allow="autoplay; fullscreen; picture-in-picture" allowfullscreen>
+          </iframe>
+        </div>
+        """
+    else:  # YouTube (default)
+        html = f"""
+        <div id="player"></div>
+        <script src="https://www.youtube.com/iframe_api"></script>
+        <script>
+          var player;
+          function onYouTubeIframeAPIReady() {{
+            player = new YT.Player('player', {{
+              height: '{height}', width: '100%', videoId: '{video_id}',
+              playerVars: {{ start: {int(start_seconds)}, autoplay: 0, rel: 0 }}
+            }});
+          }}
+        </script>
+        """
     st.components.v1.html(html, height=height + 10)
 
 
@@ -584,9 +685,9 @@ def generate_text_report(url, scenes, pacing_issues, narrative_result, script_di
 # --------------------------------------------------------------------------
 # Main analysis pipeline (drives the spinner / progress steps)
 # --------------------------------------------------------------------------
-def run_analysis(url: str, script_text: Optional[str], progress_bar, status_text):
+def run_analysis(url: str, script_text: Optional[str], progress_bar, status_text, local_video_path: Optional[str] = None):
     steps = [
-        "Downloading video...",
+        "Preparing video...",
         "Transcribing audio...",
         "Detecting shots...",
         "Calculating pacing metrics...",
@@ -596,7 +697,10 @@ def run_analysis(url: str, script_text: Optional[str], progress_bar, status_text
     n = len(steps)
 
     status_text.text(steps[0]); progress_bar.progress(1 / n)
-    video_path = download_video(url)
+    if local_video_path:
+        video_path = local_video_path
+    else:
+        video_path = download_video(url)
 
     status_text.text(steps[1]); progress_bar.progress(2 / n)
     transcript = transcribe_audio(video_path)
@@ -657,13 +761,30 @@ def main():
                                      help="Expand every issue card with an educational explanation.")
         st.divider()
         st.subheader("Input")
-        url = st.text_input("YouTube URL (short film, under ~5 min)", value="")
+        
+        input_method = st.radio("Source", ["YouTube/Vimeo URL", "Local Video"], horizontal=True)
+        
+        url = None
+        local_video = None
+        if input_method == "YouTube/Vimeo URL":
+            url = st.text_input("YouTube, Vimeo, or Frame.io URL (short film, under ~5 min)", value="")
+        else:
+            st.markdown(f"**Max file size: {MAX_VIDEO_SIZE_MB}MB**")
+            local_video = st.file_uploader("Upload video file", type=["mp4", "mov", "avi", "mkv", "webm"])
+            if local_video is not None:
+                file_size_mb = local_video.size / (1024 * 1024)
+                if file_size_mb > MAX_VIDEO_SIZE_MB:
+                    st.error(f"❌ File too large: {file_size_mb:.1f}MB (max: {MAX_VIDEO_SIZE_MB}MB)\n\nTry:\n- Using the YouTube URL option instead\n- Compressing the video with ffmpeg: `ffmpeg -i input.mp4 -vcodec libx265 -crf 28 output.mp4`\n- Trimming the video to under 5 minutes")
+                    local_video = None
+                else:
+                    st.success(f"✓ {file_size_mb:.1f}MB")
+        
         script_file = st.file_uploader("Optional script (.txt)", type=["txt"])
         analyse_clicked = st.button("Analyse", use_container_width=True)
-        demo_clicked = st.button("Run Demo (Chaplin's \"The Kid\")", use_container_width=True)
+        demo_clicked = st.button("Run Demo (Vimeo demo clip)", use_container_width=True)
         st.caption("First run downloads the Whisper 'base' model (~140MB) — this only happens once.")
-        if get_openai_client() is None:
-            st.warning("No OPENAI_API_KEY found — narrative consistency check will be skipped.")
+        if get_claude_client() is None:
+            st.warning("No ANTHROPIC_API_KEY found — narrative consistency check will be skipped.")
 
     if "results" not in st.session_state:
         st.session_state.results = None
@@ -671,15 +792,30 @@ def main():
         st.session_state.seek_to = 0
 
     target_url = None
+    video_path = None
+    platform = "youtube"
     if demo_clicked:
         target_url = DEMO_URL
+        platform = "youtube"
     elif analyse_clicked:
-        target_url = url.strip() or DEMO_URL
+        if input_method == "Local Video":
+            if local_video is not None:
+                # Save uploaded file to temp location
+                temp_dir = os.path.join(tempfile.gettempdir(), "editorial_review_poc")
+                os.makedirs(temp_dir, exist_ok=True)
+                video_path = os.path.join(temp_dir, local_video.name)
+                with open(video_path, "wb") as f:
+                    f.write(local_video.getbuffer())
+            else:
+                st.error("Please select a video file to analyse.")
+                return
+        else:
+            target_url = url.strip() or DEMO_URL
 
     if target_url:
-        video_id = extract_video_id(target_url)
+        video_id, platform = extract_video_id_and_platform(target_url)
         if not video_id:
-            st.error("That doesn't look like a valid YouTube URL.")
+            st.error("That doesn't look like a valid YouTube, Vimeo, or Frame.io URL.")
             return
 
         script_text = None
@@ -693,6 +829,32 @@ def main():
                 results = run_analysis(target_url, script_text, progress_bar, status_text)
             results["video_id"] = video_id
             results["url"] = target_url
+            results["platform"] = platform
+            st.session_state.results = results
+            st.session_state.seek_to = 0
+            status_text.text("Done.")
+        except RuntimeError as exc:
+            st.error(f"Could not analyse this video: {exc}")
+            return
+        except Exception as exc:  # noqa: BLE001 - surface any pipeline failure to the user
+            st.error(f"Unexpected error during analysis: {exc}")
+            return
+    elif video_path:
+        script_text = read_script_text(script_file)
+
+        progress_bar = st.progress(0.0)
+        status_text = st.empty()
+        try:
+            with st.spinner("Running editorial analysis..."):
+                results = run_analysis(
+                    url="",
+                    script_text=script_text,
+                    progress_bar=progress_bar,
+                    status_text=status_text,
+                    local_video_path=video_path
+                )
+            results["video_id"] = None
+            results["url"] = None
             st.session_state.results = results
             st.session_state.seek_to = 0
             status_text.text("Done.")
@@ -705,13 +867,16 @@ def main():
 
     results = st.session_state.results
     if not results:
-        st.info("Paste a YouTube link and click **Analyse**, or click **Run Demo** to try "
-                "the tool with a public-domain example.")
+        st.info("Paste a YouTube, Vimeo, or Frame.io link and click **Analyse**, or click **Run Demo** to try "
+                "the tool with a demo clip, or upload a local video file.")
         return
 
     # ---- Dashboard ----
     st.subheader("Source video")
-    youtube_embed(results["video_id"], start_seconds=st.session_state.seek_to)
+    if results.get("video_id"):
+        youtube_embed(results["video_id"], start_seconds=st.session_state.seek_to, platform=results.get("platform", "youtube"))
+    else:
+        st.info("ℹ️ This analysis was performed on a locally uploaded video file.")
 
     st.subheader("Pacing & shot timeline")
     scene_boundaries = [sc["start"] for sc in results["scenes"]]
