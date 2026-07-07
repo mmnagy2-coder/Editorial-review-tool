@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -m py_compile app.py)",
+      "Bash(git fetch *)",
+      "Bash(git rev-list *)",
+      "Bash(git reset *)",
+      "Bash(python3 -c \"import imageio_ffmpeg\")",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)",
+      "Bash(gh auth *)",
+      "Bash(git config *)",
+      "Bash(security find-internet-password *)",
+      "Bash(which gh; echo \"---ssh keys---\"; ls -la ~/.ssh 2>&1; echo \"---git remote url---\"; git remote -v; echo \"---try push dry-run to see exact error---\"; git push origin claude/editorial-review-poc-rierjv 2>&1)"
+    ]
+  }
+}
